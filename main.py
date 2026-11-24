@@ -1,11 +1,10 @@
 """
-Command line.
+Command line. Everything is driven by a config file (see config.py).
 
-    python main.py generate data/retail                  # -> semantic.json
-    python main.py validate data/retail                  # validate semantic.json against the data
-    python main.py generate sqlserver                    # same, on SQL Server (MSSQL_* env vars)
+    python main.py generate config.json      # scan the listed tables -> semantic layer
+    python main.py validate config.json      # check that layer against the data (-v: show passes)
 
-Options: -o/--layer PATH (default semantic.json). validate exits 1 if any check FAILs.
+validate exits 1 if any check FAILs.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ import sys
 
 import semantic
 import validate
-from db import open_database
+from config import ConfigError, load_config, open_source, roles
 
 
 def print_layer(layer: dict) -> None:
@@ -47,19 +46,27 @@ def print_layer(layer: dict) -> None:
         for n in s["notes"]:
             print(f"  NOTE {n}")
 
+    if layer.get("notes"):
+        print("\nNotes")
+        for n in layer["notes"]:
+            print(f"  NOTE {n}")
+
 
 def cmd_generate(args) -> int:
-    with open_database(args.source) as db:
-        layer = semantic.generate(db)
-    semantic.save(layer, args.layer)
+    cfg = load_config(args.config)
+    with open_source(cfg) as db:
+        layer = semantic.generate(db, roles(cfg, db))
+        print(f"Scanned {len(db.tables())} table(s) listed in {args.config}\n")
+    semantic.save(layer, cfg["output"])
     print_layer(layer)
-    print(f"\nwritten to {args.layer}")
+    print(f"\nwritten to {cfg['output']}")
     return 0
 
 
 def cmd_validate(args) -> int:
-    layer = semantic.load(args.layer)
-    with open_database(args.source) as db:
+    cfg = load_config(args.config)
+    layer = semantic.load(cfg["output"])
+    with open_source(cfg) as db:
         results = validate.validate(db, layer)
     order = {"FAIL": 0, "WARN": 1, "PASS": 2}
     for r in sorted(results, key=lambda r: order[r["status"]]):
@@ -77,13 +84,16 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     for name, fn in (("generate", cmd_generate), ("validate", cmd_validate)):
         sp = sub.add_parser(name)
-        sp.add_argument("source", help="CSV folder, or 'sqlserver' to use MSSQL_* env vars")
-        sp.add_argument("-o", "--layer", default="semantic.json")
+        sp.add_argument("config", help="config file listing the source, facts and dimensions")
         sp.set_defaults(func=fn)
         if name == "validate":
             sp.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except (ConfigError, ValueError, FileNotFoundError) as e:
+        print(f"ERROR  {e}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

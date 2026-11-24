@@ -1,0 +1,16 @@
+{
+  "source": {
+    "type": "sqlserver",
+    "server": "sql01.example.local",
+    "port": 1433,
+    "database": "SalesDW",
+    "user": "bi_reader",
+    "password_env": "MSSQL_PASSWORD",
+    "trust_server_certificate": false
+  },
+
+  "facts": ["dbo.FactSales"],
+  "dimensions": ["dbo.DimCustomer", "dbo.DimProduct", "dbo.DimDate"],
+
+  "output": "semantic.json"
+}

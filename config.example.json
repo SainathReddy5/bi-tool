@@ -1,0 +1,9 @@
+{
+  "source": { "type": "csv", "folder": "data/retail" },
+
+  "facts": ["fact_sales", "fact_returns"],
+  "dimensions": ["dim_customer", "dim_product", "dim_category",
+                 "dim_date", "dim_store", "order_status"],
+
+  "output": "semantic.json"
+}

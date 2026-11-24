@@ -187,7 +187,9 @@ def _fk_columns(rels: list[dict], table: str) -> set[str]:
     return {c.lower() for r in rels if r["from_table"] == table for c in r["from_columns"]}
 
 
-def classify_tables(meta: dict, rels: list[dict]) -> dict:
+def classify_tables(meta: dict, rels: list[dict], given: dict[str, str] | None = None) -> dict:
+    """Role per table. `given` ({table: "fact"|"dimension"}, from the config) always wins;
+    the scored guess is still computed so disagreements can be reported."""
     max_rows = max((i["row_count"] for i in meta["tables"].values()), default=0) or 1
     out = {}
     for t, info in meta["tables"].items():
@@ -255,13 +257,22 @@ def classify_tables(meta: dict, rels: list[dict]) -> dict:
             add("staging", 2, "no keys and no relationships")
 
         best, pts = score.most_common(1)[0] if score else ("unknown", 0)
-        role = best if pts >= 3 else "unknown"
+        guess = best if pts >= 3 else "unknown"
         out[t] = {
-            "role": role,
+            "role": guess,
             "scores": dict(score),
-            "reasons": reasons.get(role, []),
+            "reasons": reasons.get(guess, []),
             "row_count": rows,
         }
+        if given and t in given:
+            role = given[t]
+            out[t].update(role=role, reasons=["set in config"], guessed_role=guess)
+            # lookup/bridge are kinds of dimension; only flag real contradictions
+            looks = "dimension" if guess in ("lookup", "bridge") else guess
+            if looks in ("fact", "dimension") and looks != role:
+                why = "; ".join(reasons.get(guess, []))
+                out[t]["note"] = (f"{t} is configured as {role} but looks like a {guess} ({why}); "
+                                  f"using {role} as configured")
     return out
 
 
@@ -446,11 +457,14 @@ def _grain(db, meta: dict, fact: str, rels: list[dict]) -> dict:
 # Entry points
 # --------------------------------------------------------------------------- #
 
-def generate(db) -> dict:
+def generate(db, roles: dict[str, str] | None = None) -> dict:
+    """roles: {table: "fact" | "dimension"} from the config; None = guess every role."""
     meta = read_metadata(db)
     rels = find_relationships(db, meta)
-    roles = classify_tables(meta, rels)
+    given = roles
+    roles = classify_tables(meta, rels, given)
     stars = build_stars(meta, rels, roles)
+    notes = [info["note"] for info in roles.values() if "note" in info]
 
     shared = Counter(d["table"] for s in stars for d in {x["table"]: x for x in s["dimensions"]}.values())
     for s in stars:
@@ -460,6 +474,18 @@ def generate(db) -> dict:
             s["notes"].append(
                 "shares dimensions with another fact (" + ", ".join(conformed) + "): "
                 "aggregate each fact separately before combining (chasm trap)")
+
+    # facts with nothing joined, dimensions no fact reaches, FKs to tables not scanned
+    reached = {d["table"] for s in stars for d in s["dimensions"]}
+    for s in stars:
+        if not s["dimensions"]:
+            notes.append(f"fact {s['fact_table']} has no dimensions joined to it")
+    for t, info in roles.items():
+        if info["role"] in ("dimension", "lookup") and t not in reached:
+            notes.append(f"dimension {t} is not joined to any fact")
+    for fk in db.foreign_keys_leaving_scope():
+        notes.append(f"{fk['table']}.{', '.join(fk['columns'])} references {fk['ref_table']}, "
+                     f"which is not in the config; add it to use it as a dimension")
 
     for t, info in meta["tables"].items():
         roles[t]["description"] = info["description"]
@@ -474,6 +500,10 @@ def generate(db) -> dict:
                        "primary_key": meta["tables"][t]["primary_key"]} for t in meta["tables"]},
         "relationships": rels,
         "stars": stars,
+        "notes": notes,
+        **({"config": {"facts": sorted(t for t, r in given.items() if r == "fact"),
+                       "dimensions": sorted(t for t, r in given.items() if r == "dimension")}}
+           if given else {}),
     }
 
 

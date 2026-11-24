@@ -11,10 +11,12 @@ validate.py) never knows which one it is talking to:
 
 Metadata methods
     tables()                     -> ["fact_sales", ...]   (SQL Server: "dbo.fact_sales")
+                                    only the tables passed as `tables=` (from the config)
     columns(table)               -> [{"name", "type", "family", "nullable"}, ...]
     primary_key(table)           -> ["col", ...]  ([] if none)
     unique_keys(table)           -> [["col", ...], ...]   (includes the primary key)
     foreign_keys()               -> [{"name", "table", "columns", "ref_table", "ref_columns"}]
+    foreign_keys_leaving_scope() -> declared FKs pointing at a table that was not scanned
     row_count(table)             -> int
     description(table, column=None) -> str | None
 
@@ -47,6 +49,43 @@ _FAMILY_BY_TYPE = {
 }
 
 
+def resolve_tables(wanted: list[str], available: list[str]) -> list[str]:
+    """Map names from the config to real table names.
+
+    'dbo.FactSales' must match exactly (case-insensitive); 'FactSales' matches
+    any schema. Unknown or ambiguous names raise ValueError with suggestions.
+    """
+    import difflib
+
+    by_full = {a.lower(): a for a in available}
+    by_base: dict[str, list[str]] = {}
+    for a in available:
+        by_base.setdefault(a.split(".")[-1].lower(), []).append(a)
+
+    out, problems = [], []
+    for w in wanted:
+        key = w.strip().lower()
+        if key in by_full:
+            hit = by_full[key]
+        elif "." not in key and len(by_base.get(key, [])) == 1:
+            hit = by_base[key][0]
+        elif "." not in key and len(by_base.get(key, [])) > 1:
+            problems.append(f"'{w}' is ambiguous, matches: {', '.join(by_base[key])} "
+                            f"(add the schema)")
+            continue
+        else:
+            candidates = list(dict.fromkeys(list(by_full) + list(by_base)))
+            close = difflib.get_close_matches(key, candidates, n=3, cutoff=0.6)
+            hint = f" (did you mean {', '.join(close)}?)" if close else ""
+            problems.append(f"table '{w}' not found{hint}")
+            continue
+        if hit not in out:
+            out.append(hit)
+    if problems:
+        raise ValueError("; ".join(problems))
+    return out
+
+
 def type_family(native_type: str) -> str:
     """'DECIMAL(12,2)' -> 'decimal', 'nvarchar' -> 'string', unknown -> 'other'."""
     t = native_type.lower().split("(")[0].strip()
@@ -75,6 +114,9 @@ class Database:
 
     def close(self) -> None:
         pass
+
+    def foreign_keys_leaving_scope(self) -> list[dict]:
+        return []
 
     def __enter__(self):
         return self
@@ -170,19 +212,22 @@ class CsvDatabase(Database):
         }
     """
 
-    def __init__(self, folder: str | Path):
+    def __init__(self, folder: str | Path, tables: list[str] | None = None):
+        """tables: only these are loaded (names as in the config); None = every CSV."""
         import duckdb
 
         self.folder = Path(folder)
         if not self.folder.is_dir():
             raise FileNotFoundError(f"CSV folder not found: {self.folder}")
+        files = {p.stem: p for p in sorted(self.folder.glob("*.csv"))}
+        names = resolve_tables(tables, list(files)) if tables is not None else list(files)
+
         self.con = duckdb.connect(":memory:")
         self._tables: list[str] = []
-        for path in sorted(self.folder.glob("*.csv")):
-            name = path.stem
+        for name in names:
             self.con.execute(
                 f"CREATE TABLE {self.quote(name)} AS SELECT * FROM read_csv(?, header = true)",
-                [str(path)],
+                [str(files[name])],
             )
             self._tables.append(name)
 
@@ -220,17 +265,26 @@ class CsvDatabase(Database):
         pk = self.primary_key(table)
         return ([pk] if pk else []) + keys
 
+    def _all_foreign_keys(self):
+        return [{
+            "name": fk.get("name", f"fk_{fk['table']}_{'_'.join(fk['columns'])}"),
+            "table": fk["table"],
+            "columns": list(fk["columns"]),
+            "ref_table": fk["ref_table"],
+            "ref_columns": list(fk["ref_columns"]),
+        } for fk in self.constraints.get("foreign_keys", [])]
+
     def foreign_keys(self):
-        out = []
-        for i, fk in enumerate(self.constraints.get("foreign_keys", [])):
-            out.append({
-                "name": fk.get("name", f"fk_{fk['table']}_{'_'.join(fk['columns'])}"),
-                "table": fk["table"],
-                "columns": list(fk["columns"]),
-                "ref_table": fk["ref_table"],
-                "ref_columns": list(fk["ref_columns"]),
-            })
-        return out
+        """Declared FKs with both ends among the loaded tables."""
+        loaded = set(self._tables)
+        return [fk for fk in self._all_foreign_keys()
+                if fk["table"] in loaded and fk["ref_table"] in loaded]
+
+    def foreign_keys_leaving_scope(self):
+        """Declared FKs from a loaded table to a table that was not loaded."""
+        loaded = set(self._tables)
+        return [fk for fk in self._all_foreign_keys()
+                if fk["table"] in loaded and fk["ref_table"] not in loaded]
 
     def row_count(self, table):
         return int(self.query(f"SELECT COUNT(*) FROM {self.table_ref(table)}")[0][0])
@@ -282,26 +336,15 @@ def build_connection_string(server: str, database: str, user: str | None = None,
 class SqlServerDatabase(Database):
     """Microsoft SQL Server via pyodbc. Table names are 'schema.table'."""
 
-    def __init__(self, connection_string: str, login_timeout: int = 15, query_timeout: int = 300):
+    def __init__(self, connection_string: str, tables: list[str] | None = None,
+                 login_timeout: int = 15, query_timeout: int = 300):
+        """tables: only these are scanned (names as in the config); None = whole database."""
         import pyodbc
 
         self.con = pyodbc.connect(connection_string, timeout=login_timeout, autocommit=True)
         self.con.timeout = query_timeout
+        self.wanted = tables
         self._meta: dict | None = None
-
-    @classmethod
-    def from_env(cls) -> "SqlServerDatabase":
-        """Build from MSSQL_SERVER, MSSQL_DATABASE, MSSQL_USER, MSSQL_PASSWORD
-        (optional MSSQL_PORT, MSSQL_TRUSTED=1, MSSQL_TRUST_CERT=1)."""
-        import os
-
-        e = os.environ
-        return cls(build_connection_string(
-            e["MSSQL_SERVER"], e["MSSQL_DATABASE"], e.get("MSSQL_USER"), e.get("MSSQL_PASSWORD"),
-            port=int(e["MSSQL_PORT"]) if e.get("MSSQL_PORT") else None,
-            trusted=e.get("MSSQL_TRUSTED") == "1",
-            trust_server_certificate=e.get("MSSQL_TRUST_CERT") == "1",
-        ))
 
     def quote(self, name):
         return "[" + name.replace("]", "]]") + "]"
@@ -312,30 +355,37 @@ class SqlServerDatabase(Database):
     def close(self):
         self.con.close()
 
-    # ---- metadata: read the whole catalog once, then answer from memory --- #
+    # ---- metadata: read the catalog once (scoped tables only), answer from memory #
 
     def _load(self) -> dict:
         if self._meta is not None:
             return self._meta
-        tables: dict[str, dict] = {}
-
-        for schema, name, otype in self.query("""
-            SELECT s.name, o.name, o.type
+        # 1. Object names only (cheap), then keep just the tables from the config.
+        objects = {f"{schema}.{name}": (oid, otype.strip()) for oid, schema, name, otype in self.query("""
+            SELECT o.object_id, s.name, o.name, o.type
             FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id
             WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0
-            ORDER BY s.name, o.name"""):
-            tables[f"{schema}.{name}"] = {"kind": "view" if otype.strip() == "V" else "table",
-                                          "columns": [], "pk": [], "unique": {},
-                                          "rows": None, "desc": None, "col_desc": {}}
+            ORDER BY s.name, o.name""")}
+        names = resolve_tables(self.wanted, list(objects)) if self.wanted is not None else list(objects)
+        tables: dict[str, dict] = {
+            n: {"kind": "view" if objects[n][1] == "V" else "table", "columns": [], "pk": [],
+                "unique": {}, "rows": None, "desc": None, "col_desc": {}}
+            for n in names
+        }
 
-        for schema, tname, cname, typ, max_len, prec, scale, nullable in self.query("""
+        # 2. Every other catalog query is limited to those objects (one parameter,
+        #    so no 2100-parameter limit). STRING_SPLIT needs SQL Server 2016+.
+        ids = ",".join(str(objects[n][0]) for n in names) or "0"
+        in_scope = "IN (SELECT CAST(value AS int) FROM STRING_SPLIT(?, ','))"
+
+        for schema, tname, cname, typ, max_len, prec, scale, nullable in self.query(f"""
             SELECT s.name, o.name, c.name, t.name, c.max_length, c.precision, c.scale, c.is_nullable
             FROM sys.columns c
             JOIN sys.objects o ON o.object_id = c.object_id
             JOIN sys.schemas s ON s.schema_id = o.schema_id
             JOIN sys.types t   ON t.user_type_id = c.user_type_id
-            WHERE o.type IN ('U', 'V') AND o.is_ms_shipped = 0
-            ORDER BY s.name, o.name, c.column_id"""):
+            WHERE o.object_id {in_scope}
+            ORDER BY s.name, o.name, c.column_id""", [ids]):
             t = tables.get(f"{schema}.{tname}")
             if t is None:
                 continue
@@ -351,7 +401,7 @@ class SqlServerDatabase(Database):
                                  "nullable": bool(nullable)})
 
         # Unique, enabled, unfiltered indexes (PRIMARY KEY + UNIQUE constraints/indexes).
-        for schema, tname, iname, is_pk, cname in self.query("""
+        for schema, tname, iname, is_pk, cname in self.query(f"""
             SELECT s.name, o.name, i.name, i.is_primary_key, c.name
             FROM sys.indexes i
             JOIN sys.objects o        ON o.object_id = i.object_id
@@ -360,8 +410,8 @@ class SqlServerDatabase(Database):
                                      AND ic.is_included_column = 0
             JOIN sys.columns c        ON c.object_id = ic.object_id AND c.column_id = ic.column_id
             WHERE i.is_unique = 1 AND i.is_disabled = 0 AND i.has_filter = 0
-              AND o.is_ms_shipped = 0
-            ORDER BY s.name, o.name, i.index_id, ic.key_ordinal"""):
+              AND o.object_id {in_scope}
+            ORDER BY s.name, o.name, i.index_id, ic.key_ordinal""", [ids]):
             t = tables.get(f"{schema}.{tname}")
             if t is None:
                 continue
@@ -369,23 +419,23 @@ class SqlServerDatabase(Database):
             if is_pk:
                 t["pk"].append(cname)
 
-        for schema, tname, rows in self.query("""
+        for schema, tname, rows in self.query(f"""
             SELECT s.name, o.name, SUM(p.rows)
             FROM sys.partitions p
             JOIN sys.objects o ON o.object_id = p.object_id
             JOIN sys.schemas s ON s.schema_id = o.schema_id
-            WHERE p.index_id IN (0, 1) AND o.type = 'U'
-            GROUP BY s.name, o.name"""):
+            WHERE p.index_id IN (0, 1) AND o.type = 'U' AND o.object_id {in_scope}
+            GROUP BY s.name, o.name""", [ids]):
             if f"{schema}.{tname}" in tables:
                 tables[f"{schema}.{tname}"]["rows"] = int(rows)
 
-        for schema, tname, cname, value in self.query("""
+        for schema, tname, cname, value in self.query(f"""
             SELECT s.name, o.name, c.name, CAST(ep.value AS nvarchar(4000))
             FROM sys.extended_properties ep
             JOIN sys.objects o ON o.object_id = ep.major_id
             JOIN sys.schemas s ON s.schema_id = o.schema_id
             LEFT JOIN sys.columns c ON c.object_id = ep.major_id AND c.column_id = ep.minor_id
-            WHERE ep.class = 1 AND ep.name = 'MS_Description'"""):
+            WHERE ep.class = 1 AND ep.name = 'MS_Description' AND o.object_id {in_scope}""", [ids]):
             t = tables.get(f"{schema}.{tname}")
             if t is None:
                 continue
@@ -395,7 +445,8 @@ class SqlServerDatabase(Database):
                 t["col_desc"][cname] = value
 
         fks: dict[str, dict] = {}
-        for fk_name, ps, pt, pc, rs, rt, rc in self.query("""
+        # FKs whose child table is in scope; the parent may be outside it.
+        for fk_name, ps, pt, pc, rs, rt, rc in self.query(f"""
             SELECT fk.name, ps.name, pt.name, pc.name, rs.name, rt.name, rc.name
             FROM sys.foreign_keys fk
             JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
@@ -407,8 +458,8 @@ class SqlServerDatabase(Database):
             JOIN sys.schemas rs ON rs.schema_id = rt.schema_id
             JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id
                                AND rc.column_id = fkc.referenced_column_id
-            WHERE fk.is_disabled = 0
-            ORDER BY fk.name, fkc.constraint_column_id"""):
+            WHERE fk.is_disabled = 0 AND fkc.parent_object_id {in_scope}
+            ORDER BY fk.name, fkc.constraint_column_id""", [ids]):
             key = f"{ps}.{fk_name}"
             fk = fks.setdefault(key, {"name": fk_name, "table": f"{ps}.{pt}", "columns": [],
                                       "ref_table": f"{rs}.{rt}", "ref_columns": []})
@@ -431,7 +482,14 @@ class SqlServerDatabase(Database):
         return [list(cols) for cols in self._load()["tables"][table]["unique"].values()]
 
     def foreign_keys(self):
-        return [dict(fk) for fk in self._load()["fks"]]
+        """Declared FKs with both ends among the scanned tables."""
+        meta = self._load()
+        return [dict(fk) for fk in meta["fks"] if fk["ref_table"] in meta["tables"]]
+
+    def foreign_keys_leaving_scope(self):
+        """Declared FKs from a scanned table to a table that is not scanned."""
+        meta = self._load()
+        return [dict(fk) for fk in meta["fks"] if fk["ref_table"] not in meta["tables"]]
 
     def row_count(self, table):
         rows = self._load()["tables"][table]["rows"]
@@ -443,9 +501,3 @@ class SqlServerDatabase(Database):
         t = self._load()["tables"][table]
         return t["col_desc"].get(column) if column else t["desc"]
 
-
-def open_database(source: str) -> Database:
-    """'sqlserver' -> SqlServerDatabase.from_env(); anything else is a CSV folder."""
-    if source == "sqlserver":
-        return SqlServerDatabase.from_env()
-    return CsvDatabase(source)
